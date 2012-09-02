@@ -28,7 +28,6 @@
 #include <linux/workqueue.h>
 #include <linux/gpio.h>
 #include <linux/wakelock.h>
-#include <linux/spinlock.h>
 
 struct gpio_button_data {
 	struct gpio_keys_button *button;
@@ -51,8 +50,50 @@ struct gpio_keys_drvdata {
 struct wake_lock power_key_wake_lock;
 extern int resume_from_deep_suspend;
 bool doCheck;
-bool resumeSentPwr;
-DEFINE_SPINLOCK(lock);
+
+static DEFINE_MUTEX(wakeup_mutex);
+static unsigned char wakeup_bitmask;
+static unsigned char set_wakeup;
+static unsigned int vol_up_irq;
+static unsigned int vol_down_irq;
+// for change the volup/voldown wakeup status
+static ssize_t vol_wakeup_store(struct device *dev,
+					 struct device_attribute *attr,
+					 const char *buf, size_t count)
+{
+	unsigned char bitmask = 0;
+	bitmask = simple_strtoull(buf, NULL, 10);
+	mutex_lock(&wakeup_mutex);
+	if (bitmask) {
+		if (bitmask == 127)
+			wakeup_bitmask &= bitmask;
+		else if (bitmask > 128)
+			wakeup_bitmask &= bitmask;
+		else
+			wakeup_bitmask |= bitmask;
+	}
+
+	if (wakeup_bitmask && (!set_wakeup)) {
+		enable_irq_wake(vol_up_irq);
+		enable_irq_wake(vol_down_irq);
+		set_wakeup = 1;
+		printk(KERN_INFO "%s:change to wake up function(%d, %d)\n", __func__, vol_up_irq, vol_down_irq);
+	} else if ((!wakeup_bitmask) && set_wakeup){
+		disable_irq_wake(vol_up_irq);
+		disable_irq_wake(vol_down_irq);
+		set_wakeup = 0;
+		printk(KERN_INFO "%s:change to non-wake up function(%d, %d)\n", __func__, vol_up_irq, vol_down_irq);
+	}
+	mutex_unlock(&wakeup_mutex);
+	return count;
+}
+static ssize_t vol_wakeup_show(struct device *dev,
+					struct device_attribute *attr, char *buf)
+{
+	return sprintf(buf, "%x\n", wakeup_bitmask);
+}
+
+static DEVICE_ATTR(vol_wakeup, 0664, vol_wakeup_show, vol_wakeup_store);
 /*
  * SYSFS interface for enabling/disabling keys and switches:
  *
@@ -333,36 +374,20 @@ static void gpio_keys_report_event(struct gpio_button_data *bdata)
 	unsigned int type = button->type ?: EV_KEY;
 	int state = (gpio_get_value_cansleep(button->gpio) ? 1 : 0) ^ button->active_low;
 
-	spin_lock(&lock);
 	if(!doCheck) {
-		doCheck = true;
-	spin_unlock(&lock);
 		if (resume_from_deep_suspend && (KEY_POWER == button->code) && state == 0) {
 			input_event(input, type, button->code, 1);
 			pr_info("[KEY] send power key code 1.\n");
 			//workaround for isr lost. Send down key code to input subsystem; but it has make down,down,up patten case for normal isr.
 		}
-	} else
-		spin_unlock(&lock);
-
+		doCheck = true;
+	}
 	if ((KEY_POWER == button->code) && (0 == state)) {
 		printk(KERN_INFO "[KEY] Power key released\n");
 	}
 
-	if ((KEY_POWER != button->code)) {
-		input_event(input, type, button->code, !!state);
-		input_sync(input);
-	} else {
-		spin_lock(&lock);
-		if( resumeSentPwr ){
-			resumeSentPwr = false;
-			spin_unlock(&lock);
-		} else {
-			spin_unlock(&lock);
-			input_event(input, type, button->code, !!state);
-			input_sync(input);
-		}
-	}
+	input_event(input, type, button->code, !!state);
+	input_sync(input);
 	printk(KERN_INFO "[KEY] GPIO key status, key code = %d, state = %d\n", button->code, state);
 }
 
@@ -435,6 +460,13 @@ static int __devinit gpio_keys_setup_key(struct platform_device *pdev,
 		goto fail3;
 	}
 
+	if (button->code == KEY_VOLUMEUP ||
+            button->code == KEY_VOLUMEDOWN ) {
+		if (button->code == KEY_VOLUMEUP)
+			vol_up_irq = irq;
+		else
+			vol_down_irq = irq;
+	}
 	irqflags = IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING;
 	/*
 	 * If platform has specified that the button can be disabled,
@@ -481,6 +513,7 @@ static int __devinit gpio_keys_probe(struct platform_device *pdev)
 	struct input_dev *input;
 	int i, error;
 	int wakeup = 0;
+	struct kobject *keyboard_kobj;
 	doCheck = true;
 
 	ddata = kzalloc(sizeof(struct gpio_keys_drvdata) +
@@ -541,6 +574,16 @@ static int __devinit gpio_keys_probe(struct platform_device *pdev)
 			error);
 		goto fail2;
 	}
+
+	keyboard_kobj = kobject_create_and_add("keyboard", NULL);
+	if (keyboard_kobj == NULL) {
+		printk(KERN_ERR "[KEY] KEY_ERR: %s: subsystem_register failed\n", __func__);
+		return -ENOMEM;
+	}
+	if (sysfs_create_file(keyboard_kobj, &dev_attr_vol_wakeup.attr))
+		pr_err("%s: sysfs_create_file error", __func__);
+	wakeup_bitmask = 0;
+	set_wakeup = 0;
 
 	error = input_register_device(input);
 	if (error) {
@@ -622,7 +665,6 @@ static int gpio_keys_suspend(struct device *dev)
 		}
 	}
 	doCheck = false;
-	resumeSentPwr = false;
 	return 0;
 }
 
@@ -643,19 +685,10 @@ static int gpio_keys_resume(struct device *dev)
 		if (button->wakeup && device_may_wakeup(&pdev->dev)) {
 			int irq = gpio_to_irq(button->gpio);
 			disable_irq_wake(irq);
-			spin_lock(&lock);
-			if (wakeup_key == button->code && !doCheck) {
-				unsigned int type = button->type ?: EV_KEY;
-				doCheck = true;
-				resumeSentPwr = true;
-				spin_unlock(&lock);
-				input_event(ddata->input, type, button->code, 1);
-				input_event(ddata->input, type, button->code, 0);
-				input_sync(ddata->input);
-				pr_info("[KEY] Wakup source is power key, send key code.\n");
+
+			if (wakeup_key == button->code) {
 				wake_lock_timeout(&power_key_wake_lock, 5 * HZ);
-			} else
-				spin_unlock(&lock);
+			}
 		}
 		if (KEY_POWER != button->code)
 			gpio_keys_report_event(&ddata->data[i]);
